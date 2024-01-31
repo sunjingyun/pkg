@@ -3,8 +3,8 @@
 'use strict';
 
 const assert = require('assert');
-const fetch = require('@yao-pkg/pkg-fetch');
-const dontBuild = require('@yao-pkg/pkg-fetch/lib-es5/upload.js').dontBuild;
+const fetch = require('@sunjingyun/pkg-fetch');
+const dontBuild = require('@sunjingyun/pkg-fetch/lib-es5/upload.js').dontBuild;
 const knownPlatforms = fetch.system.knownPlatforms;
 const items = [];
 

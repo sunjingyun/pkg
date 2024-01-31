@@ -2,7 +2,7 @@
 
 ![](https://res.cloudinary.com/zeit-inc/image/upload/v1509936789/repositories/pkg/pkg-repo-banner-new.png)
 
-[![Build Status](https://github.com/yao-pkg/pkg/actions/workflows/ci.yml/badge.svg)](https://github.com/yao-pkg/pkg/actions/workflows/ci.yml)
+[![Build Status](https://github.com/sunjingyun/pkg/actions/workflows/ci.yml/badge.svg)](https://github.com/sunjingyun/pkg/actions/workflows/ci.yml)
 
 This command line interface enables you to package your Node.js project into an executable that can be run even on devices without Node.js installed.
 
@@ -21,7 +21,7 @@ This command line interface enables you to package your Node.js project into an 
 ## Usage
 
 ```sh
-npm install -g @yao-pkg/pkg
+npm install -g @sunjingyun/pkg
 ```
 
 After installing it, run `pkg --help` without arguments to see list of options:
@@ -261,7 +261,7 @@ option to `pkg`. First ensure your computer meets the
 requirements to compile original Node.js:
 [BUILDING.md](https://github.com/nodejs/node/blob/HEAD/BUILDING.md)
 
-See [pkg-fetch](https://github.com/yao-pkg/pkg-fetch) for more info.
+See [pkg-fetch](https://github.com/sunjingyun/pkg-fetch) for more info.
 
 ### Compression
 
@@ -275,7 +275,7 @@ The startup time of the application might be reduced slightly.
 
 ### Environment
 
-All pkg-cache [environment vars](https://github.com/yao-pkg/pkg-fetch#environment), plus:
+All pkg-cache [environment vars](https://github.com/sunjingyun/pkg-fetch#environment), plus:
 
 | Var              | Description                                                                                                                                                          |
 | ---------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------- |

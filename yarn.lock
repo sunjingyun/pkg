@@ -486,10 +486,10 @@
   resolved "https://registry.npmjs.org/@sindresorhus/is/-/is-5.6.0.tgz"
   integrity sha512-TV7t8GKYaJWsn00tFDqBw8+Uqmr8A0fRU1tvTQhyZzGv0sJCGRQL3JGMI3ucuKo3XIZdUP+Lx7/gh2t3lewy7g==
 
-"@sunjingyun/pkg-fetch@^3.5.8":
-  version "3.5.8"
-  resolved "https://registry.npmjs.org/@sunjingyun/pkg-fetch/-/pkg-fetch-3.5.8.tgz"
-  integrity sha512-t9u5ydgK8veje3PDo6NMpvEwCrle/21YYNcNBc5EWRTIRO6NUH8v+8A+orbAKH9cvO2LNdyJVSc0eSzgJ2dQrg==
+"@sunjingyun/pkg-fetch@^3.5.9":
+  version "3.5.9"
+  resolved "https://registry.npmjs.org/@sunjingyun/pkg-fetch/-/pkg-fetch-3.5.9.tgz"
+  integrity sha512-AfXcQj1r2CVJJ5yaP1LxNKccu0+GtumspE83nyReMk7xNy03G3MQNabC4Ebm2TIXt6+NWm5GlB/cTzjdpr2slA==
   dependencies:
     chalk "^4.1.2"
     fs-extra "^9.1.0"

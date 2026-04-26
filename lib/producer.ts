@@ -39,7 +39,10 @@ function discoverPlaceholder(
   padder: string,
 ): Placeholder | NotFound {
   const placeholder = Buffer.from(searchString);
-  const position = binaryBuffer.indexOf(placeholder);
+  // Node 20.20+ can contain duplicated embedded JS chunks.
+  // Using the last occurrence makes placeholder injection target the
+  // runtime-executed bootstrap segment instead of stale copies.
+  const position = binaryBuffer.lastIndexOf(placeholder);
 
   if (position === -1) {
     return { notFound: true };

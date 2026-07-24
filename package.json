@@ -1,6 +1,6 @@
 {
   "name": "@sunjingyun/pkg",
-  "version": "5.12.0",
+  "version": "5.12.1",
   "description": "Package your Node.js project into an executable",
   "main": "lib-es5/index.js",
   "license": "MIT",
@@ -30,7 +30,7 @@
     "fs-extra": "^9.1.0",
     "globby": "^11.1.0",
     "into-stream": "^6.0.0",
-    "is-core-module": "2.9.0",
+    "is-core-module": "2.16.2",
     "minimist": "^1.2.6",
     "multistream": "^4.1.0",
     "prebuild-install": "7.1.1",

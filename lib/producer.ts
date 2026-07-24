@@ -90,7 +90,11 @@ function injectPlaceholder(
   stringValue = Buffer.concat([stringValue, padding]);
 
   let i = 0;
-  const writeNext = (err: NodeJS.ErrnoException | null, written: number, buffer: Buffer) => {
+  const writeNext = (
+    err: NodeJS.ErrnoException | null,
+    written: number,
+    buffer: Buffer,
+  ) => {
     if (err) {
       return cb(err, written, buffer);
     }

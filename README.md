@@ -56,6 +56,8 @@ pkg [options] <input>
     $ pkg .
   – Makes executable for particular target machine
     $ pkg -t node16-win-arm64 index.js
+  – Makes executable for Node 24.14.1 on Linux x64
+    $ pkg -t node24.14.1-linux-x64 index.js
   – Makes executables for target machines of your choice
     $ pkg -t node16-linux,node18-linux,node16-win index.js
   – Bakes '--expose-gc' and '--max-heap-size=34' into executable
@@ -86,11 +88,13 @@ time. You can specify a comma-separated list of targets via `--targets`
 option. A canonical target consists of 3 elements, separated by
 dashes, for example `node18-macos-x64` or `node14-linux-arm64`:
 
-- **nodeRange** (node8), node10, node12, node14, node16, node18, node20, node24 or latest
+- **nodeRange** (node8), node10, node12, node14, node16, node18, node20, node24 / node24.14.1, or latest
 - **platform** alpine, linux, linuxstatic, win, macos, (freebsd)
 - **arch** x64, arm64, (armv6, armv7)
 
 (element) is unsupported, but you may try to compile yourself.
+
+Node **24** support uses patched **v24.14.1** from `@sunjingyun/pkg-fetch` (for example `-t node24.14.1-linux-x64`). `node24` / `latest` resolve to that version. It has been smoke-tested on linux-x64 (Debian 12 bookworm container). Other 24.x minors are not supported.
 
 You may omit any element (and specify just `node14` for example).
 The omitted elements will be taken from current platform or

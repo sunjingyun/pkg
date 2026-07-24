@@ -86,7 +86,7 @@ time. You can specify a comma-separated list of targets via `--targets`
 option. A canonical target consists of 3 elements, separated by
 dashes, for example `node18-macos-x64` or `node14-linux-arm64`:
 
-- **nodeRange** (node8), node10, node12, node14, node16 or latest
+- **nodeRange** (node8), node10, node12, node14, node16, node18, node20, node24 or latest
 - **platform** alpine, linux, linuxstatic, win, macos, (freebsd)
 - **arch** x64, arm64, (armv6, armv7)
 

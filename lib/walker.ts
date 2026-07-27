@@ -1,11 +1,9 @@
-/* eslint-disable require-atomic-updates */
-
 import assert from 'assert';
-import fs from 'fs-extra';
-import isCore from 'is-core-module';
-import globby from 'globby';
+import fs from 'fs/promises';
 import path from 'path';
-import chalk from 'chalk';
+import module, { builtinModules } from 'module';
+import picomatch from 'picomatch';
+import { globSync } from 'tinyglobby';
 
 import {
   ALIAS_AS_RELATIVE,
@@ -18,32 +16,30 @@ import {
   isDotJSON,
   isDotNODE,
   isPackageJson,
+  unlikelyJavascript,
   normalizePath,
   toNormalizedRealPath,
+  isESMFile,
 } from './common';
 
+import { pc } from './colors';
 import { follow } from './follow';
 import { log, wasReported } from './log';
 import * as detector from './detector';
+import { transformESMtoCJS, rewriteMjsRequirePaths } from './esm-transformer';
 import {
   ConfigDictionary,
   FileRecord,
   FileRecords,
+  Marker,
   Patches,
   PackageJson,
   SymLinks,
+  WalkerParams,
 } from './types';
+import pkgOptions from './options';
 
-export interface Marker {
-  hasDictionary?: boolean;
-  activated?: boolean;
-  toplevel?: boolean;
-  public?: boolean;
-  hasDeployFiles?: boolean;
-  config?: PackageJson;
-  configPath: string;
-  base: string;
-}
+export type { Marker, WalkerParams };
 
 interface Task {
   file: string;
@@ -72,8 +68,28 @@ const strictVerify = Boolean(process.env.PKG_STRICT_VER);
 
 const win32 = process.platform === 'win32';
 
-function unlikelyJavascript(file: string) {
-  return ['.css', '.html', '.json', '.vue'].includes(path.extname(file));
+// Extensions to try when resolving modules
+// Includes .mjs to support ESM files that get transformed to .js
+const MODULE_RESOLVE_EXTENSIONS = ['.js', '.json', '.node', '.mjs'];
+
+/**
+ * Checks if a module is a core module
+ * module.isBuiltin is available in Node.js 16.17.0 or later. Use that if available
+ * as prefix-only modules (those starting with 'node:') can only be checked that way.
+ */
+function isBuiltin(moduleName: string) {
+  if (
+    Reflect.has(module, 'isBuiltin') &&
+    typeof module.isBuiltin === 'function'
+  ) {
+    return module.isBuiltin(moduleName);
+  }
+
+  const moduleNameWithoutPrefix = moduleName.startsWith('node:')
+    ? moduleName.slice(5)
+    : moduleName;
+
+  return builtinModules.includes(moduleNameWithoutPrefix);
 }
 
 function isPublic(config: PackageJson) {
@@ -179,7 +195,7 @@ function upon(p: string, base: string) {
 }
 
 function collect(ps: string[]) {
-  return globby.sync(ps, { dot: true });
+  return globSync(ps, { absolute: true, dot: true });
 }
 
 function expandFiles(efs: string | string[], base: string) {
@@ -210,8 +226,16 @@ async function stepRead(record: FileRecord) {
   record.body = body;
 }
 
+// Strip BOM and shebang from the file body.
+//
+// IMPORTANT: leave `record.body` untouched on no-op. Reassigning it (e.g.
+// `record.body = body.toString('utf8')`) would convert Buffer → string even
+// when nothing was stripped, defeating the in-memory body reuse optimization
+// in `sea-assets.ts`: the SEA archive writer trusts that an unmodified body
+// equals the disk content byte-for-byte, so we must not silently retype it.
 function stepStrip(record: FileRecord) {
-  let body = (record.body || '').toString('utf8');
+  const original = (record.body || '').toString('utf8');
+  let body = original;
 
   if (/^\ufeff/.test(body)) {
     body = body.replace(/^\ufeff/, '');
@@ -221,7 +245,9 @@ function stepStrip(record: FileRecord) {
     body = body.replace(/^#![^\n]*\n/, '\n');
   }
 
-  record.body = body;
+  if (body !== original) {
+    record.body = body;
+  }
 }
 
 function stepDetect(
@@ -236,86 +262,118 @@ function stepDetect(
   }
 
   try {
-    detector.detect(body, (node, trying) => {
-      const { toplevel } = marker;
-      let d = detector.visitorSuccessful(node) as unknown as Derivative;
+    detector.detect(
+      body,
+      (node, trying, requireAliases) => {
+        const { toplevel } = marker;
+        let d = detector.visitorSuccessful(
+          node,
+          false,
+          requireAliases,
+        ) as unknown as Derivative;
 
-      if (d) {
-        if (d.mustExclude) {
+        if (d) {
+          if (d.mustExclude) {
+            return false;
+          }
+
+          d.mayExclude = d.mayExclude || trying;
+          derivatives.push(d);
+
           return false;
         }
 
-        d.mayExclude = d.mayExclude || trying;
-        derivatives.push(d);
+        d = detector.visitorNonLiteral(
+          node,
+          requireAliases,
+        ) as unknown as Derivative;
 
-        return false;
-      }
+        if (d) {
+          if (typeof d === 'object' && d.mustExclude) {
+            return false;
+          }
 
-      d = detector.visitorNonLiteral(node) as unknown as Derivative;
-
-      if (d) {
-        if (typeof d === 'object' && d.mustExclude) {
+          const debug = !toplevel || d.mayExclude || trying;
+          const level = debug ? 'debug' : 'warn';
+          log[level](`Cannot resolve '${d.alias}'`, [
+            record.file,
+            'Dynamic require may fail at run time, because the requested file',
+            'is unknown at compilation time and not included into executable.',
+            "Use a string literal as an argument for 'require', or leave it",
+            "as is and specify the resolved file name in 'scripts' option.",
+          ]);
           return false;
         }
 
-        const debug = !toplevel || d.mayExclude || trying;
-        const level = debug ? 'debug' : 'warn';
-        log[level](`Cannot resolve '${d.alias}'`, [
-          record.file,
-          'Dynamic require may fail at run time, because the requested file',
-          'is unknown at compilation time and not included into executable.',
-          "Use a string literal as an argument for 'require', or leave it",
-          "as is and specify the resolved file name in 'scripts' option.",
-        ]);
-        return false;
-      }
+        d = detector.visitorMalformed(
+          node,
+          requireAliases,
+        ) as unknown as Derivative;
 
-      d = detector.visitorMalformed(node) as unknown as Derivative;
+        if (d) {
+          // there is no 'mustExclude'
+          const debug = !toplevel || trying;
+          const level = debug ? 'debug' : 'warn'; // there is no 'mayExclude'
+          log[level](`Malformed requirement for '${d.alias}'`, [record.file]);
+          return false;
+        }
 
-      if (d) {
-        // there is no 'mustExclude'
-        const debug = !toplevel || trying;
-        const level = debug ? 'debug' : 'warn'; // there is no 'mayExclude'
-        log[level](`Malformed requirement for '${d.alias}'`, [record.file]);
-        return false;
-      }
+        d = detector.visitorUseSCWD(node) as unknown as Derivative;
 
-      d = detector.visitorUseSCWD(node) as unknown as Derivative;
+        if (d) {
+          // there is no 'mustExclude'
+          const level = 'debug'; // there is no 'mayExclude'
+          log[level](`Path.resolve(${d.alias}) is ambiguous`, [
+            record.file,
+            "It resolves relatively to 'process.cwd' by default, however",
+            "you may want to use 'path.dirname(require.main.filename)'",
+          ]);
 
-      if (d) {
-        // there is no 'mustExclude'
-        const level = 'debug'; // there is no 'mayExclude'
-        log[level](`Path.resolve(${d.alias}) is ambiguous`, [
-          record.file,
-          "It resolves relatively to 'process.cwd' by default, however",
-          "you may want to use 'path.dirname(require.main.filename)'",
-        ]);
+          return false;
+        }
 
-        return false;
-      }
-
-      return true; // can i go inside?
-    });
+        return true; // can i go inside?
+      },
+      record.file,
+      isESMFile(record.file),
+    );
   } catch (error) {
     log.error((error as Error).message, record.file);
     throw wasReported((error as Error).message);
   }
 }
 
-function findCommonJunctionPoint(file: string, realFile: string) {
+/**
+ * Find a common junction point between a symlink and the real file path.
+ *
+ * @param {string} file The file path, including symlink(s).
+ * @param {string} realFile The real path to the file.
+ *
+ * @throws {Error} If no common junction point is found prior to hitting the
+ *                 filesystem root.
+ */
+async function findCommonJunctionPoint(file: string, realFile: string) {
   // find common denominator => where the link changes
-  while (toNormalizedRealPath(path.dirname(file)) === path.dirname(realFile)) {
+  while (true) {
+    const stats = await fs.lstat(file);
+
+    if (stats.isSymbolicLink()) {
+      return { file, realFile };
+    }
+
     file = path.dirname(file);
     realFile = path.dirname(realFile);
+
+    // If the directory is /, break out of the loop and log an error.
+    if (
+      file === path.parse(file).root ||
+      realFile === path.parse(realFile).root
+    ) {
+      throw new Error(
+        'Reached root directory without finding a common junction point',
+      );
+    }
   }
-
-  return { file, realFile };
-}
-
-export interface WalkerParams {
-  publicToplevel?: boolean;
-  publicPackages?: string[];
-  noDictionary?: string[];
 }
 
 class Walker {
@@ -384,8 +442,8 @@ class Walker {
     }
   }
 
-  appendSymlink(file: string, realFile: string) {
-    const a = findCommonJunctionPoint(file, realFile);
+  async appendSymlink(file: string, realFile: string) {
+    const a = await findCommonJunctionPoint(file, realFile);
     file = a.file;
     realFile = a.realFile;
 
@@ -441,14 +499,35 @@ class Walker {
     });
   }
 
-  appendBlobOrContent(task: Task) {
+  async appendBlobOrContent(task: Task) {
     if (strictVerify) {
       assert(task.file === normalizePath(task.file));
     }
 
     assert(task.store === STORE_BLOB || task.store === STORE_CONTENT);
+
+    // In SEA mode, always store as content (no V8 bytecode compilation)
+    if (this.params.seaMode && task.store === STORE_BLOB) {
+      task.store = STORE_CONTENT;
+    }
+
     assert(typeof task.file === 'string');
     const realFile = toNormalizedRealPath(task.file);
+
+    const { ignore } = pkgOptions.get();
+    if (ignore) {
+      // check if the file matches one of the ignore regex patterns
+      const match = picomatch.isMatch(realFile, ignore, {
+        windows: win32,
+      });
+
+      if (match) {
+        log.debug(
+          `Ignoring file: ${realFile} due to top level config ignore pattern`,
+        );
+        return;
+      }
+    }
 
     if (realFile === task.file) {
       this.append(task);
@@ -456,7 +535,7 @@ class Walker {
     }
 
     this.append({ ...task, file: realFile });
-    this.appendSymlink(task.file, realFile);
+    await this.appendSymlink(task.file, realFile);
     this.appendStat({
       file: task.file,
       store: STORE_STAT,
@@ -484,7 +563,7 @@ class Walker {
               ]);
             }
 
-            this.appendBlobOrContent({
+            await this.appendBlobOrContent({
               file: normalizePath(script),
               marker,
               store: STORE_BLOB,
@@ -504,7 +583,7 @@ class Walker {
           const stat = await fs.stat(asset);
 
           if (stat.isFile()) {
-            this.appendBlobOrContent({
+            await this.appendBlobOrContent({
               file: normalizePath(asset),
               marker,
               store: STORE_CONTENT,
@@ -528,14 +607,14 @@ class Walker {
             // 2) non-source (non-js) files of top-level package are shipped as CONTENT
             // 3) parsing some js 'files' of non-top-level packages fails, hence all CONTENT
             if (marker.toplevel) {
-              this.appendBlobOrContent({
+              await this.appendBlobOrContent({
                 file,
                 marker,
                 store: isDotJS(file) ? STORE_BLOB : STORE_CONTENT,
                 reason: configPath,
               });
             } else {
-              this.appendBlobOrContent({
+              await this.appendBlobOrContent({
                 file,
                 marker,
                 store: STORE_CONTENT,
@@ -612,8 +691,15 @@ class Walker {
       if (patches) {
         for (const key in patches) {
           if (patches[key]) {
-            const p = path.join(base, key);
+            const p = normalizePath(path.join(base, key));
             this.patches[p] = patches[key];
+
+            // Assets / earlier walks may have already loaded the file before
+            // this package's dictionary activated. Re-apply the patch now.
+            const existing = this.records[p];
+            if (existing?.body) {
+              this.stepPatch(existing);
+            }
           }
         }
       }
@@ -667,6 +753,12 @@ class Walker {
     }
 
     return true;
+  }
+
+  needsSeaRead(record: FileRecord): boolean {
+    return (
+      !!this.params.seaMode && (isDotJS(record.file) || isESMFile(record.file))
+    );
   }
 
   stepPatch(record: FileRecord) {
@@ -724,7 +816,7 @@ class Walker {
     }
 
     if (stat && stat.isFile()) {
-      this.appendBlobOrContent({
+      await this.appendBlobOrContent({
         file,
         marker,
         store: STORE_CONTENT,
@@ -747,7 +839,11 @@ class Walker {
 
     const catchPackageFilter = (config: PackageJson, base: string) => {
       const newPackage = newPackages[newPackages.length - 1];
-      newPackage.marker = { config, configPath: newPackage.packageJson, base };
+      newPackage.marker = {
+        config,
+        configPath: newPackage.packageJson,
+        base,
+      };
     };
 
     let newFile = '';
@@ -761,7 +857,8 @@ class Walker {
         // it is not enough because 'typos.json'
         // is not taken in require('./typos')
         // in 'normalize-package-data/lib/fixer.js'
-        extensions: ['.js', '.json', '.node'],
+        // Also include .mjs to support ESM files that get transformed to .js
+        extensions: MODULE_RESOLVE_EXTENSIONS,
         catchReadFile,
         catchPackageFilter,
       });
@@ -786,7 +883,7 @@ class Walker {
           `%2: ${record.file}`,
         ]);
       } else {
-        log[level](`${chalk.yellow(failure.message)}  in ${record.file}`);
+        log[level](`${pc.yellow(failure.message)}  in ${record.file}`);
       }
 
       return;
@@ -800,7 +897,7 @@ class Walker {
       try {
         newFile2 = await follow(derivative.alias, {
           basedir: path.dirname(record.file),
-          extensions: ['.js', '.json', '.node'],
+          extensions: MODULE_RESOLVE_EXTENSIONS,
           ignoreFile: newPackage.packageJson,
         });
         if (strictVerify) {
@@ -816,6 +913,32 @@ class Walker {
       }
     }
 
+    // Add all discovered package.json files, not just the one determined by the double-resolution logic
+    // This is necessary because ESM resolution may bypass the standard packageFilter mechanism
+    // However, only include package.json files that are either:
+    // 1. Inside node_modules (dependencies)
+    // 2. Inside the base directory of the current marker (application being packaged)
+    // This prevents including pkg's own package.json when used from source
+    for (const newPackage of newPackages) {
+      if (newPackage.marker) {
+        const file = newPackage.packageJson;
+        const isInNodeModules = file.includes(
+          `${path.sep}node_modules${path.sep}`,
+        );
+        const isInMarkerBase = marker.base && file.startsWith(marker.base);
+
+        if (isInNodeModules || isInMarkerBase) {
+          await this.appendBlobOrContent({
+            file,
+            marker: newPackage.marker,
+            store: STORE_CONTENT,
+            reason: record.file,
+          });
+        }
+      }
+    }
+
+    // Keep the original logic for determining the marker for the resolved file
     if (newPackageForNewRecords) {
       if (strictVerify) {
         assert(
@@ -823,15 +946,9 @@ class Walker {
             normalizePath(newPackageForNewRecords.packageJson),
         );
       }
-      this.appendBlobOrContent({
-        file: newPackageForNewRecords.packageJson,
-        marker: newPackageForNewRecords.marker,
-        store: STORE_CONTENT,
-        reason: record.file,
-      });
     }
 
-    this.appendBlobOrContent({
+    await this.appendBlobOrContent({
       file: newFile,
       marker: newPackageForNewRecords ? newPackageForNewRecords.marker : marker,
       store: STORE_BLOB,
@@ -846,7 +963,7 @@ class Walker {
   ) {
     for (const derivative of derivatives) {
       // TODO: actually use the target node version
-      if (isCore(derivative.alias, '99.0.0')) continue;
+      if (isBuiltin(derivative.alias)) continue;
 
       switch (derivative.aliasType) {
         case ALIAS_AS_RELATIVE:
@@ -887,7 +1004,7 @@ class Walker {
 
     if (store === STORE_BLOB) {
       if (unlikelyJavascript(record.file) || isDotNODE(record.file)) {
-        this.appendBlobOrContent({
+        await this.appendBlobOrContent({
           file: record.file,
           marker,
           store: STORE_CONTENT,
@@ -896,7 +1013,7 @@ class Walker {
       }
 
       if (marker.public || marker.hasDictionary) {
-        this.appendBlobOrContent({
+        await this.appendBlobOrContent({
           file: record.file,
           marker,
           store: STORE_CONTENT,
@@ -904,20 +1021,151 @@ class Walker {
       }
     }
 
-    if (store === STORE_BLOB || this.hasPatch(record)) {
+    const needsSeaRead = this.needsSeaRead(record);
+
+    if (
+      store === STORE_BLOB ||
+      needsSeaRead ||
+      (store === STORE_CONTENT && isPackageJson(record.file)) ||
+      this.hasPatch(record)
+    ) {
       if (!record.body) {
         await stepRead(record);
-        this.stepPatch(record);
 
-        if (store === STORE_BLOB) {
+        if (store === STORE_BLOB || needsSeaRead) {
           stepStrip(record);
         }
       }
 
-      if (store === STORE_BLOB) {
+      // Always apply dictionary patches once body is available. Previously
+      // stepPatch ran only inside `if (!record.body)`, so files already loaded
+      // as assets (e.g. generator-function/package.json) never got patched.
+      this.stepPatch(record);
+
+      // Patch package.json files to add synthetic main field if needed
+      if (
+        store === STORE_CONTENT &&
+        isPackageJson(record.file) &&
+        record.body
+      ) {
+        try {
+          const pkgContent = JSON.parse(record.body.toString('utf8'));
+          let modified = false;
+
+          // If package has exports but no main, add a synthetic main field
+          if (pkgContent.exports && !pkgContent.main) {
+            // Try to get main from marker.config first (set by catchPackageFilter in follow.ts)
+            if (marker.config?.main) {
+              pkgContent.main = marker.config.main;
+              modified = true;
+            } else {
+              // Fallback: try to infer main from exports field
+              const { exports } = pkgContent;
+              if (typeof exports === 'string') {
+                pkgContent.main = exports;
+                modified = true;
+              } else if (exports && typeof exports === 'object') {
+                // Handle conditional exports
+                if (exports['.']) {
+                  if (typeof exports['.'] === 'string') {
+                    pkgContent.main = exports['.'];
+                    modified = true;
+                  } else if (typeof exports['.'] === 'object') {
+                    // Try to get the best entry point for CJS
+                    // Prefer: require > node > default
+                    let mainEntry: string | undefined;
+
+                    if (
+                      typeof exports['.'].require === 'string' &&
+                      exports['.'].require
+                    ) {
+                      mainEntry = exports['.'].require;
+                    } else if (
+                      typeof exports['.'].node === 'string' &&
+                      exports['.'].node
+                    ) {
+                      mainEntry = exports['.'].node;
+                    } else if (
+                      typeof exports['.'].default === 'string' &&
+                      exports['.'].default
+                    ) {
+                      mainEntry = exports['.'].default;
+                    }
+
+                    if (mainEntry) {
+                      pkgContent.main = mainEntry;
+                      modified = true;
+                    }
+                  }
+                }
+              }
+            }
+          }
+
+          // If package has "type": "module", we need to change it to "commonjs"
+          // because we transform all ESM files to CJS before bytecode compilation
+          if (pkgContent.type === 'module' && !this.params.seaMode) {
+            pkgContent.type = 'commonjs';
+            modified = true;
+          }
+
+          // Only rewrite if we made changes
+          if (modified) {
+            record.body = Buffer.from(
+              JSON.stringify(pkgContent, null, 2),
+              'utf8',
+            );
+          }
+        } catch (_error) {
+          // Ignore JSON parsing errors
+        }
+      }
+
+      // Transform ESM to CJS before bytecode compilation
+      // Check all JS-like files (.js, .mjs, .cjs) but only transform ESM ones
+      if (
+        store === STORE_BLOB &&
+        !this.params.seaMode &&
+        record.body &&
+        (isDotJS(record.file) || record.file.endsWith('.mjs'))
+      ) {
+        if (isESMFile(record.file)) {
+          try {
+            const result = transformESMtoCJS(
+              record.body.toString('utf8'),
+              record.file,
+            );
+            if (result.isTransformed) {
+              record.body = Buffer.from(result.code, 'utf8');
+              // Mark .mjs files as transformed so packer can rename them to .js
+              if (record.file.endsWith('.mjs')) {
+                record.wasTransformed = true;
+              }
+            }
+          } catch (error) {
+            const message =
+              error instanceof Error ? error.message : String(error);
+            throw new Error(
+              `Failed to transform ESM module to CJS for file "${record.file}": ${message}`,
+            );
+          }
+        }
+      }
+
+      if (store === STORE_BLOB || needsSeaRead) {
         const derivatives2: Derivative[] = [];
         stepDetect(record, marker, derivatives2);
         await this.stepDerivatives(record, marker, derivatives2);
+
+        // After dependencies are resolved, rewrite .mjs require paths to .js
+        // since the packer renames .mjs files to .js in the snapshot.
+        // Skip in SEA mode — ESM-to-CJS transform is not applied there.
+        if (!this.params.seaMode && record.wasTransformed && record.body) {
+          record.body = Buffer.from(
+            rewriteMjsRequirePaths(record.body.toString('utf8')),
+            'utf8',
+          );
+        }
       }
     }
 
@@ -994,7 +1242,6 @@ class Walker {
     switch (store) {
       case STORE_BLOB:
       case STORE_CONTENT:
-        // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
         await this.step_STORE_ANY(record, task.marker!, store);
         break;
       case STORE_LINKS:
@@ -1022,7 +1269,7 @@ class Walker {
         if (this.params.noDictionary?.includes(file)) {
           continue;
         }
-        // eslint-disable-next-line import/no-dynamic-require, global-require, @typescript-eslint/no-var-requires
+        // eslint-disable-next-line @typescript-eslint/no-require-imports
         const config = require(path.join(dd, file));
         this.dictionary[name] = config;
       }
@@ -1056,7 +1303,7 @@ class Walker {
 
     entrypoint = normalizePath(entrypoint);
 
-    this.appendBlobOrContent({
+    await this.appendBlobOrContent({
       file: entrypoint,
       marker,
       store: STORE_BLOB,
@@ -1064,7 +1311,7 @@ class Walker {
 
     if (addition) {
       addition = normalizePath(addition);
-      this.appendBlobOrContent({
+      await this.appendBlobOrContent({
         file: addition,
         marker,
         store: STORE_CONTENT,

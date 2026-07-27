@@ -32,6 +32,11 @@ function patchCommand(type: number, buf: Buffer, file: Buffer) {
   }
 }
 
+/**
+ * It would be nice to explain the purpose of this patching function
+ * @param file
+ * @returns
+ */
 function patchMachOExecutable(file: Buffer) {
   const align = 8;
   const hsize = 32;

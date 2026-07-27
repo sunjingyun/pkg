@@ -2,7 +2,7 @@ import { createBrotliCompress, createGzip } from 'zlib';
 import Multistream from 'multistream';
 import assert from 'assert';
 import { execFileSync } from 'child_process';
-import fs from 'fs-extra';
+import fs from 'fs';
 import intoStream from 'into-stream';
 import path from 'path';
 import streamMeter from 'stream-meter';
@@ -13,15 +13,14 @@ import { log, wasReported } from './log';
 import { fabricateTwice } from './fabricator';
 import { platform, SymLinks, Target } from './types';
 import { Stripe } from './packer';
-import { CompressType } from './compress_type';
+import { CompressType, getZstdCompressStream } from './compress_type';
 
 interface NotFound {
   notFound: true;
 }
 
 interface Placeholder {
-  /** All offsets of this placeholder in the binary (Node 20+/24 embed JS more than once). */
-  positions: number[];
+  position: number;
   size: number;
   padder: string;
 }
@@ -38,26 +37,38 @@ function discoverPlaceholder(
   binaryBuffer: Buffer,
   searchString: string,
   padder: string,
+  searchOffset: number = 0,
 ): Placeholder | NotFound {
-  const needle = Buffer.from(searchString);
-  const positions: number[] = [];
-  // Node 20.20+ / 24 can embed duplicated JS chunks. Inject into every copy so
-  // the runtime-executed segment is always patched (lastIndexOf alone is not enough on 24).
-  let from = 0;
-  while (from <= binaryBuffer.length - needle.length) {
-    const position = binaryBuffer.indexOf(needle, from);
-    if (position === -1) {
-      break;
-    }
-    positions.push(position);
-    from = position + needle.length;
-  }
+  const placeholder = Buffer.from(searchString);
+  const position = binaryBuffer.indexOf(placeholder, searchOffset);
 
-  if (positions.length === 0) {
+  if (position === -1) {
     return { notFound: true };
   }
 
-  return { positions, size: needle.length, padder };
+  /**
+   * the PAYLOAD/PRELUDE placeholders can occur twice in the binaries:
+   *  - in source text as a string literal
+   *  - in bytecode as a raw string
+   * the ordering depends on the platform - we need to make sure that
+   * the bytecode string is replaced, not the source literal.
+   *
+   * this rejects the source code literal if it occurs first in the binary
+   * also see: https://github.com/yao-pkg/pkg/pull/86
+   */
+  if (binaryBuffer[position - 1] === 39 /* ascii for ' APOSTROPHE */) {
+    const nextPlaceholder = discoverPlaceholder(
+      binaryBuffer,
+      searchString,
+      padder,
+      position + placeholder.length,
+    );
+    if (!('notFound' in nextPlaceholder)) {
+      return nextPlaceholder;
+    }
+  }
+
+  return { position, size: placeholder.length, padder };
 }
 
 function injectPlaceholder(
@@ -74,7 +85,7 @@ function injectPlaceholder(
     assert(false, 'Placeholder for not found');
   }
 
-  const { positions, size, padder } = placeholder;
+  const { position, size, padder } = placeholder;
   let stringValue: Buffer = Buffer.from('');
 
   if (typeof value === 'number') {
@@ -88,24 +99,7 @@ function injectPlaceholder(
   const padding = Buffer.from(padder.repeat(size - stringValue.length));
 
   stringValue = Buffer.concat([stringValue, padding]);
-
-  let i = 0;
-  const writeNext = (
-    err: NodeJS.ErrnoException | null,
-    written: number,
-    buffer: Buffer,
-  ) => {
-    if (err) {
-      return cb(err, written, buffer);
-    }
-    i += 1;
-    if (i >= positions.length) {
-      return cb(null, written, buffer);
-    }
-    fs.write(fd, stringValue, 0, stringValue.length, positions[i], writeNext);
-  };
-
-  fs.write(fd, stringValue, 0, stringValue.length, positions[0], writeNext);
+  fs.write(fd, stringValue, 0, stringValue.length, position, cb);
 }
 
 function discoverPlaceholders(binaryBuffer: Buffer) {
@@ -226,12 +220,36 @@ function findPackageJson(nodeFile: string) {
   return dir;
 }
 
+function getPrebuildEnvPrefix(pkgName: string): string {
+  return `npm_config_${(pkgName || '')
+    .replace(/[^a-zA-Z0-9]/g, '_')
+    .replace(/^_/, '')}`;
+}
+
 function nativePrebuildInstall(target: Target, nodeFile: string) {
   const prebuildInstall = path.join(
     __dirname,
     '../node_modules/.bin/prebuild-install',
   );
   const dir = findPackageJson(nodeFile);
+  const packageJson = JSON.parse(
+    fs.readFileSync(path.join(dir, 'package.json'), { encoding: 'utf-8' }),
+  );
+
+  // only try prebuild-install for packages that actually use it or if
+  // explicitly configured via environment variables
+  const envPrefix = getPrebuildEnvPrefix(packageJson.name);
+  if (
+    packageJson.dependencies?.['prebuild-install'] == null &&
+    ![
+      `${envPrefix}_binary_host`,
+      `${envPrefix}_binary_host_mirror`,
+      `${envPrefix}_local_prebuilds`,
+    ].some((i) => i in process.env)
+  ) {
+    return;
+  }
+
   // parse the target node version from the binaryPath
   const nodeVersion = path.basename(target.binaryPath).split('-')[1];
 
@@ -250,9 +268,7 @@ function nativePrebuildInstall(target: Target, nodeFile: string) {
     fs.copyFileSync(nodeFile, `${nodeFile}.bak`);
   }
 
-  const napiVersions = JSON.parse(
-    fs.readFileSync(path.join(dir, 'package.json'), { encoding: 'utf-8' }),
-  )?.binary?.napi_versions;
+  const napiVersions = packageJson?.binary?.napi_versions;
 
   const options = [
     '--platform',
@@ -264,6 +280,8 @@ function nativePrebuildInstall(target: Target, nodeFile: string) {
   if (napiVersions == null) {
     // TODO: consider target node version and supported n-api version
     options.push('--target', nodeVersion);
+  } else {
+    options.push('--runtime', 'napi');
   }
 
   // run prebuild
@@ -273,7 +291,7 @@ function nativePrebuildInstall(target: Target, nodeFile: string) {
   fs.copyFileSync(nodeFile, nativeFile);
 
   // put the backed up file back
-  fs.moveSync(`${nodeFile}.bak`, nodeFile, { overwrite: true });
+  fs.renameSync(`${nodeFile}.bak`, nodeFile);
 
   return nativeFile;
 }
@@ -286,6 +304,7 @@ interface ProducerOptions {
   symLinks: SymLinks;
   doCompress: CompressType;
   nativeBuild: boolean;
+  fallbackToSource?: boolean;
 }
 
 /**
@@ -350,6 +369,7 @@ export default function producer({
   symLinks,
   doCompress,
   nativeBuild,
+  fallbackToSource,
 }: ProducerOptions) {
   return new Promise<void>((resolve, reject) => {
     if (!Buffer.alloc) {
@@ -384,16 +404,25 @@ export default function producer({
     let meter: streamMeter.StreamMeter;
     let count = 0;
 
+    // Resolve the codec transform factory once, up front.  For Zstd this
+    // raises a clear build-time error on a host missing the 22.15 API,
+    // instead of failing mid-stripe once we've already started writing.
+    const makeCompressStream =
+      doCompress === CompressType.GZip
+        ? createGzip
+        : doCompress === CompressType.Brotli
+          ? createBrotliCompress
+          : doCompress === CompressType.Zstd
+            ? getZstdCompressStream()
+            : null;
+
     function pipeToNewMeter(s: Readable) {
       meter = streamMeter();
       return s.pipe(meter);
     }
     function pipeMayCompressToNewMeter(s: Readable): streamMeter.StreamMeter {
-      if (doCompress === CompressType.GZip) {
-        return pipeToNewMeter(s.pipe(createGzip()));
-      }
-      if (doCompress === CompressType.Brotli) {
-        return pipeToNewMeter(s.pipe(createBrotliCompress()));
+      if (makeCompressStream) {
+        return pipeToNewMeter(s.pipe(makeCompressStream()));
       }
       return pipeToNewMeter(s);
     }
@@ -444,14 +473,33 @@ export default function producer({
           if (stripe.buffer) {
             if (stripe.store === STORE_BLOB) {
               const snap = snapshotify(stripe.snap, slash);
+              const sourceBuffer = stripe.buffer;
+
               return fabricateTwice(
                 bakes,
                 target.fabricator,
                 snap,
-                stripe.buffer,
+                sourceBuffer,
                 (error, buffer) => {
                   if (error) {
-                    log.warn(error.message);
+                    const file = stripe.file ?? snap;
+
+                    if (fallbackToSource) {
+                      log.warn(
+                        `Failed to generate V8 bytecode for ${file}. Shipping source instead. Cause: ${error.message}`,
+                      );
+                      stripe.store = STORE_CONTENT;
+                      stripe.buffer = sourceBuffer;
+                      return cb(
+                        null,
+                        pipeMayCompressToNewMeter(intoStream(sourceBuffer)),
+                      );
+                    }
+
+                    log.warn(
+                      `Failed to generate V8 bytecode for ${file}. Cause: ${error.message}. ` +
+                        `Use --fallback-to-source to include the file as plain source instead.`,
+                    );
                     stripe.skip = true;
                     return cb(null, intoStream(Buffer.alloc(0)));
                   }
@@ -488,7 +536,7 @@ export default function producer({
               try {
                 const platformFile = nativePrebuildInstall(target, stripe.file);
 
-                if (fs.existsSync(platformFile)) {
+                if (platformFile && fs.existsSync(platformFile)) {
                   return cb(
                     null,
                     pipeMayCompressToNewMeter(

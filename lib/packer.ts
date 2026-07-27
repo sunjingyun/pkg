@@ -92,11 +92,14 @@ export default function packer({
         continue;
       }
 
-      // If .mjs file was transformed to CJS, rename it to .js in the snapshot
-      // This prevents Node.js from treating it as an ES module
-      if (record.wasTransformed && snap.endsWith('.mjs')) {
-        snap = `${snap.slice(0, -4)}.js`;
-      }
+      // If .mjs file was transformed to CJS, also publish it as .js so the
+      // CJS loader does not treat the body as ESM. Keep the original .mjs
+      // snapshot path too — package.json "exports" (e.g. module-sync) still
+      // point at *.mjs, and dropping that path causes MODULE_NOT_FOUND.
+      const snapPaths =
+        record.wasTransformed && snap.endsWith('.mjs')
+          ? [snap, `${snap.slice(0, -4)}.js`]
+          : [snap];
 
       assert(record[STORE_STAT], 'packer: no STORE_STAT');
       assert(
@@ -120,64 +123,70 @@ export default function packer({
           );
         }
       }
-      for (const store of [
-        STORE_BLOB,
-        STORE_CONTENT,
-        STORE_LINKS,
-        STORE_STAT,
-      ]) {
-        const value = record[store];
+      for (const snapPath of snapPaths) {
+        for (const store of [
+          STORE_BLOB,
+          STORE_CONTENT,
+          STORE_LINKS,
+          STORE_STAT,
+        ]) {
+          const value = record[store];
 
-        if (!value) {
-          continue;
-        }
+          if (!value) {
+            continue;
+          }
 
-        if (store === STORE_BLOB || store === STORE_CONTENT) {
-          if (record.body === undefined) {
-            stripes.push({ snap, store, file });
-          } else if (Buffer.isBuffer(record.body)) {
-            stripes.push({ snap, store, buffer: record.body });
-          } else if (typeof record.body === 'string') {
-            stripes.push({ snap, store, buffer: Buffer.from(record.body) });
-          } else {
-            assert(false, 'packer: bad STORE_BLOB/STORE_CONTENT');
-          }
-        } else if (store === STORE_LINKS) {
-          if (Array.isArray(value)) {
-            const dedupedValue = [...new Set(value)];
-            log.debug('files & folders deduped = ', dedupedValue);
-            const buffer = Buffer.from(JSON.stringify(dedupedValue));
-            stripes.push({ snap, store, buffer });
-          } else {
-            assert(false, 'packer: bad STORE_LINKS');
-          }
-        } else if (store === STORE_STAT) {
-          if (typeof value === 'object') {
-            const newStat = { ...value };
-            const buffer = Buffer.from(JSON.stringify(newStat));
-            stripes.push({ snap, store, buffer });
-          } else {
-            assert(false, 'packer: unknown store');
+          if (store === STORE_BLOB || store === STORE_CONTENT) {
+            if (record.body === undefined) {
+              stripes.push({ snap: snapPath, store, file });
+            } else if (Buffer.isBuffer(record.body)) {
+              stripes.push({ snap: snapPath, store, buffer: record.body });
+            } else if (typeof record.body === 'string') {
+              stripes.push({
+                snap: snapPath,
+                store,
+                buffer: Buffer.from(record.body),
+              });
+            } else {
+              assert(false, 'packer: bad STORE_BLOB/STORE_CONTENT');
+            }
+          } else if (store === STORE_LINKS) {
+            if (Array.isArray(value)) {
+              const dedupedValue = [...new Set(value)];
+              log.debug('files & folders deduped = ', dedupedValue);
+              const buffer = Buffer.from(JSON.stringify(dedupedValue));
+              stripes.push({ snap: snapPath, store, buffer });
+            } else {
+              assert(false, 'packer: bad STORE_LINKS');
+            }
+          } else if (store === STORE_STAT) {
+            if (typeof value === 'object') {
+              const newStat = { ...value };
+              const buffer = Buffer.from(JSON.stringify(newStat));
+              stripes.push({ snap: snapPath, store, buffer });
+            } else {
+              assert(false, 'packer: unknown store');
+            }
           }
         }
+      }
 
-        if (record[STORE_CONTENT]) {
-          const disclosed = isDotJS(file) || isDotJSON(file);
-          log.debug(
-            disclosed
-              ? 'The file was included as DISCLOSED code (with sources)'
-              : 'The file was included as asset content',
-            file,
-          );
-        } else if (record[STORE_BLOB]) {
-          log.debug('The file was included as bytecode (no sources)', file);
-        } else if (record[STORE_LINKS]) {
-          const link = record[STORE_LINKS];
-          log.debug(
-            `The directory files list was included (${itemsToText(link)})`,
-            file,
-          );
-        }
+      if (record[STORE_CONTENT]) {
+        const disclosed = isDotJS(file) || isDotJSON(file);
+        log.debug(
+          disclosed
+            ? 'The file was included as DISCLOSED code (with sources)'
+            : 'The file was included as asset content',
+          file,
+        );
+      } else if (record[STORE_BLOB]) {
+        log.debug('The file was included as bytecode (no sources)', file);
+      } else if (record[STORE_LINKS]) {
+        const link = record[STORE_LINKS];
+        log.debug(
+          `The directory files list was included (${itemsToText(link)})`,
+          file,
+        );
       }
     }
   }

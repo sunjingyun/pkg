@@ -1,5 +1,5 @@
 import { sync as resolveSync } from 'resolve';
-import { exports as resolveExports } from 'resolve.exports';
+import { exports as resolveExports, imports as resolveImports } from 'resolve.exports';
 import fs from 'fs';
 import path from 'path';
 import { isESMFile } from './common';
@@ -135,6 +135,64 @@ function tryResolveESM(specifier: string, basedir: string): string | null {
   } catch {
     return null;
   }
+}
+
+/**
+ * Resolve a package.json "imports" specifier (`#ansi-styles`, etc.)
+ * by walking up from basedir to find the nearest package.json that defines it.
+ */
+export function resolvePackageImport(
+  specifier: string,
+  basedir: string,
+): string | null {
+  if (!specifier.startsWith('#')) {
+    return null;
+  }
+
+  let dir = path.resolve(basedir);
+
+  while (true) {
+    const packageJsonPath = path.join(dir, 'package.json');
+
+    if (fs.existsSync(packageJsonPath)) {
+      try {
+        const pkg = JSON.parse(fs.readFileSync(packageJsonPath, 'utf8')) as {
+          imports?: unknown;
+        };
+
+        if (pkg.imports) {
+          const resolved =
+            resolveImports(pkg as Record<string, unknown>, specifier, {
+              require: true,
+            }) ||
+            resolveImports(pkg as Record<string, unknown>, specifier, {
+              require: false,
+            });
+
+          if (resolved) {
+            const resolvedPath = Array.isArray(resolved) ? resolved[0] : resolved;
+            const fullPath = path.resolve(dir, resolvedPath);
+
+            if (fs.existsSync(fullPath)) {
+              return fullPath;
+            }
+          }
+        }
+      } catch {
+        log.debug(
+          `Failed to resolve package import ${specifier} from ${packageJsonPath}`,
+        );
+      }
+    }
+
+    const parent = path.dirname(dir);
+    if (parent === dir) {
+      break;
+    }
+    dir = parent;
+  }
+
+  return null;
 }
 
 /**

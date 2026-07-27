@@ -691,8 +691,15 @@ class Walker {
       if (patches) {
         for (const key in patches) {
           if (patches[key]) {
-            const p = path.join(base, key);
+            const p = normalizePath(path.join(base, key));
             this.patches[p] = patches[key];
+
+            // Assets / earlier walks may have already loaded the file before
+            // this package's dictionary activated. Re-apply the patch now.
+            const existing = this.records[p];
+            if (existing?.body) {
+              this.stepPatch(existing);
+            }
           }
         }
       }
@@ -1024,12 +1031,16 @@ class Walker {
     ) {
       if (!record.body) {
         await stepRead(record);
-        this.stepPatch(record);
 
         if (store === STORE_BLOB || needsSeaRead) {
           stepStrip(record);
         }
       }
+
+      // Always apply dictionary patches once body is available. Previously
+      // stepPatch ran only inside `if (!record.body)`, so files already loaded
+      // as assets (e.g. generator-function/package.json) never got patched.
+      this.stepPatch(record);
 
       // Patch package.json files to add synthetic main field if needed
       if (

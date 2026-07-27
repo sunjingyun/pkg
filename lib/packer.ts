@@ -1,7 +1,5 @@
-/* eslint-disable complexity */
-
 import assert from 'assert';
-import fs from 'fs-extra';
+import { readFileSync } from 'fs';
 import path from 'path';
 
 import {
@@ -17,19 +15,33 @@ import { log, wasReported } from './log';
 import { FileRecord, FileRecords, SymLinks } from './types';
 
 const { version } = JSON.parse(
-  fs.readFileSync(path.join(__dirname, '../package.json'), 'utf-8'),
+  readFileSync(path.join(__dirname, '../package.json'), 'utf-8'),
 );
 
-const bootstrapText = fs
-  .readFileSync(require.resolve('../prelude/bootstrap.js'), 'utf8')
-  .replace('%VERSION%', version);
+const bootstrapText = readFileSync(
+  require.resolve('../prelude/bootstrap.js'),
+  'utf8',
+).replace('%VERSION%', version);
 
-const commonText = fs.readFileSync(require.resolve('./common'), 'utf8');
+const commonText = readFileSync(require.resolve('./common'), 'utf8');
 
-const diagnosticText = fs.readFileSync(
-  require.resolve('../prelude/diagnostic.js'),
+const sharedText = readFileSync(
+  require.resolve('../prelude/bootstrap-shared.js'),
   'utf8',
 );
+
+// When --debug is used, inject a small snippet that calls the shared
+// diagnostic + dumps the DICT path compression map (traditional-mode only).
+const diagnosticText = `
+(function() {
+  if (process.env.DEBUG_PKG === '2') {
+    console.log('------------------------------- path dictionary');
+    console.log(Object.entries(DICT));
+  }
+  var snapshotPrefix = process.platform === 'win32' ? 'C:\\\\snapshot' : '/snapshot';
+  REQUIRE_SHARED.installDiagnostic(snapshotPrefix);
+})();
+`;
 
 function itemsToText<T>(items: T[]) {
   const len = items.length;
@@ -66,13 +78,24 @@ export default function packer({
 }: PackerOptions) {
   const stripes: Stripe[] = [];
 
-  for (const snap in records) {
+  // If the entrypoint was a .mjs file that got transformed, update its extension
+  if (records[entrypoint]?.wasTransformed && entrypoint.endsWith('.mjs')) {
+    entrypoint = `${entrypoint.slice(0, -4)}.js`;
+  }
+
+  for (let snap in records) {
     if (records[snap]) {
       const record = records[snap];
       const { file } = record;
 
       if (!hasAnyStore(record)) {
         continue;
+      }
+
+      // If .mjs file was transformed to CJS, rename it to .js in the snapshot
+      // This prevents Node.js from treating it as an ES module
+      if (record.wasTransformed && snap.endsWith('.mjs')) {
+        snap = `${snap.slice(0, -4)}.js`;
       }
 
       assert(record[STORE_STAT], 'packer: no STORE_STAT');
@@ -159,10 +182,11 @@ export default function packer({
     }
   }
   const prelude =
-    `return (function (REQUIRE_COMMON, VIRTUAL_FILESYSTEM, DEFAULT_ENTRYPOINT, SYMLINKS, DICT, DOCOMPRESS) {
+    `return (function (REQUIRE_COMMON, REQUIRE_SHARED, VIRTUAL_FILESYSTEM, DEFAULT_ENTRYPOINT, SYMLINKS, DICT, DOCOMPRESS) {
         ${bootstrapText}${
           log.debugMode ? diagnosticText : ''
         }\n})(function (exports) {\n${commonText}\n},\n` +
+    `(function () { var module = { exports: {} };\n${sharedText}\nreturn module.exports; })(),\n` +
     `%VIRTUAL_FILESYSTEM%` +
     `\n,\n` +
     `%DEFAULT_ENTRYPOINT%` +

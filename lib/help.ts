@@ -1,16 +1,16 @@
-import chalk from 'chalk';
+import { pc } from './colors';
 
 export default function help() {
-  // eslint-disable-next-line no-console
   console.log(`
-  ${chalk.bold('pkg')} [options] <input>
+  ${pc.bold('pkg')} [options] <input>
 
-  ${chalk.dim('Options:')}
+  ${pc.dim('Options:')}
 
     -h, --help           output usage information
     -v, --version        output pkg version
     -t, --targets        comma-separated list of targets (see examples)
-    -c, --config         package.json or any json file with top-level config
+    -c, --config         package.json or a .json, .js, .cjs, or .mjs file with top-level config
+                         (auto-discovered as .pkgrc, .pkgrc.json, pkg.config.js, pkg.config.cjs, or pkg.config.mjs)
     --options            bake v8 options into executable to run with them on
     -o, --output         output file name or template for several files
     --out-path           path to save output one or more executables
@@ -20,32 +20,40 @@ export default function help() {
     --public-packages    force specified packages to be considered public
     --no-bytecode        skip bytecode generation and include source files as plain js
     --no-native-build    skip native addons build
+    --fallback-to-source if bytecode generation fails for a file, ship it as plain source instead of skipping it
     --no-dict            comma-separated list of packages names to ignore dictionaries. Use --no-dict * to disable all dictionaries
-    -C, --compress       [default=None] compression algorithm = Brotli or GZip
+    -C, --compress       [default=None] compression algorithm = Brotli, GZip, or Zstd (Zstd requires Node.js >= 22.15)
+    --signature          enable macOS binary signing (default; use to override signature:false in config)
+    --no-signature       skip macOS binary signing [default: sign]
+    --sea                (Experimental) compile given file using node's SEA feature. Requires node v20.0.0 or higher and only single file is supported
 
-  ${chalk.dim('Examples:')}
+  All build-shaping flags above (compress, fallback-to-source, public, public-packages,
+  options, bytecode, native-build, no-dict, debug, signature, sea) can also be set in
+  the pkg config file (camelCase keys). CLI flags override config values.
 
-  ${chalk.gray('–')} Makes executables for Linux, macOS and Windows
-    ${chalk.cyan('$ pkg index.js')}
-  ${chalk.gray('–')} Takes package.json from cwd and follows 'bin' entry
-    ${chalk.cyan('$ pkg .')}
-  ${chalk.gray('–')} Makes executable for particular target machine
-    ${chalk.cyan('$ pkg -t node14-win-arm64 index.js')}
-  ${chalk.gray('–')} Makes executables for target machines of your choice
-    ${chalk.cyan('$ pkg -t node16-linux,node18-linux,node18-win index.js')}
-  ${chalk.gray(
-    '–',
-  )} Bakes '--expose-gc' and '--max-heap-size=34' into executable
-    ${chalk.cyan('$ pkg --options "expose-gc,max-heap-size=34" index.js')}
-  ${chalk.gray('–')} Consider packageA and packageB to be public
-    ${chalk.cyan('$ pkg --public-packages "packageA,packageB" index.js')}
-  ${chalk.gray('–')} Consider all packages to be public
-    ${chalk.cyan('$ pkg --public-packages "*" index.js')}
-  ${chalk.gray('–')} Bakes '--expose-gc' into executable
-    ${chalk.cyan('$ pkg --options expose-gc index.js')}
-  ${chalk.gray(
-    '–',
-  )} reduce size of the data packed inside the executable with GZip
-    ${chalk.cyan('$ pkg --compress GZip index.js')}
+  ${pc.dim('Examples:')}
+
+  ${pc.gray('–')} Makes executables for Linux, macOS and Windows
+    ${pc.cyan('$ pkg index.js')}
+  ${pc.gray('–')} Takes package.json from cwd and follows 'bin' entry
+    ${pc.cyan('$ pkg .')}
+  ${pc.gray('–')} Makes executable for particular target machine
+    ${pc.cyan('$ pkg -t node14-win-arm64 index.js')}
+  ${pc.gray('–')} Makes executables for target machines of your choice
+    ${pc.cyan('$ pkg -t node22-linux,node24-linux,node24-win index.js')}
+  ${pc.gray('–')} Bakes '--expose-gc' and '--max-heap-size=34' into executable
+    ${pc.cyan('$ pkg --options "expose-gc,max-heap-size=34" index.js')}
+  ${pc.gray('–')} Consider packageA and packageB to be public
+    ${pc.cyan('$ pkg --public-packages "packageA,packageB" index.js')}
+  ${pc.gray('–')} Consider all packages to be public
+    ${pc.cyan('$ pkg --public-packages "*" index.js')}
+  ${pc.gray('–')} Bakes '--expose-gc' into executable
+    ${pc.cyan('$ pkg --options expose-gc index.js')}
+  ${pc.gray('–')} reduce size of the data packed inside the executable with GZip
+    ${pc.cyan('$ pkg --compress GZip index.js')}
+  ${pc.gray('–')} reduce size further with Zstd (Node.js >= 22.15 required on the build host)
+    ${pc.cyan('$ pkg --compress Zstd index.js')}
+  ${pc.gray('–')} compile the file using node's SEA feature. Creates executables for Linux, macOS and Windows
+    ${pc.cyan('$ pkg --sea index.js')}
 `);
 }

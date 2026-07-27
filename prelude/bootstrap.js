@@ -1,13 +1,8 @@
-/* eslint-disable import/no-unresolved */
-/* eslint-disable global-require */
-/* eslint-disable no-underscore-dangle */
-/* eslint-disable prefer-rest-params */
-/* eslint-disable prefer-spread */
-
 /* global EXECPATH_FD */
 /* global PAYLOAD_POSITION */
 /* global PAYLOAD_SIZE */
 /* global REQUIRE_COMMON */
+/* global REQUIRE_SHARED */
 /* global VIRTUAL_FILESYSTEM */
 /* global DEFAULT_ENTRYPOINT */
 /* global DICT */
@@ -22,16 +17,9 @@ const fs = require('fs');
 const { isRegExp } = require('util').types;
 const Module = require('module');
 const path = require('path');
-const { promisify, _extend } = require('util');
+const { promisify } = require('util');
 const { Script } = require('vm');
-const { tmpdir } = require('os');
 const util = require('util');
-const {
-  brotliDecompress,
-  brotliDecompressSync,
-  gunzip,
-  gunzipSync,
-} = require('zlib');
 
 const common = {};
 REQUIRE_COMMON(common);
@@ -56,9 +44,8 @@ const NODE_VERSION_MINOR = process.version.match(/^v\d+.(\d+)/)[1] | 0;
 // ENTRYPOINT //////////////////////////////////////////////////////
 // /////////////////////////////////////////////////////////////////
 
-// set ENTRYPOINT and ARGV0 here because
-// they can be altered during process run
-const ARGV0 = process.argv[0];
+// set ENTRYPOINT here because
+// it can be altered during process run
 const EXECPATH = process.execPath;
 let ENTRYPOINT = process.argv[1];
 
@@ -177,83 +164,6 @@ function copyInChunks(
 
   fs_.closeSync(sourceFile);
   fs_.closeSync(targetFile);
-}
-
-// TODO: replace this with fs.cpSync when we drop Node < 16
-function copyFolderRecursiveSync(source, target) {
-  // Build target folder
-  const targetFolder = path.join(target, path.basename(source));
-
-  // Check if target folder needs to be created or integrated
-  if (!fs.existsSync(targetFolder)) {
-    fs.mkdirSync(targetFolder);
-  }
-
-  // Copy
-  if (fs.lstatSync(source).isDirectory()) {
-    const files = fs.readdirSync(source);
-
-    for (const file of files) {
-      // Build source name
-      const curSource = path.join(source, file);
-
-      // Call this function recursively as long as source is a directory
-      if (fs.lstatSync(curSource).isDirectory()) {
-        copyFolderRecursiveSync(curSource, targetFolder);
-      } else {
-        // Current source is a file, it must be available on the real filesystem
-        // instead of the virtual snapshot file system to load it by process.dlopen.
-        //
-        // Before we try to copy we do some checks.
-        // See https://github.com/vercel/pkg/issues/1589 for more details.
-
-        // Build target file name
-        const curTarget = path.join(targetFolder, path.basename(curSource));
-
-        if (fs.existsSync(curTarget)) {
-          // Target file already exists, read source and target file...
-          const curSourceContent = fs.readFileSync(curSource, {
-            encoding: 'binary',
-          });
-          const curTargetContent = fs.readFileSync(curTarget, {
-            encoding: 'binary',
-          });
-
-          // ...and calculate checksum from source and target file
-          const curSourceHash = createHash('sha256')
-            .update(curSourceContent)
-            .digest('hex');
-          const curTargetHash = createHash('sha256')
-            .update(curTargetContent)
-            .digest('hex');
-
-          // If checksums are equal then there is nothing to do here
-          // ==> target already exists and is up-to-date
-          if (curSourceHash === curTargetHash) {
-            continue;
-          }
-        }
-
-        // Target must be copied because it either does not exist or is outdated.
-        // Due to the possibility that mutliple instances of this app start simultaneously,
-        // the copy action might fail. Only one starting instance gets write access.
-        //
-        // We don't catch any error here because it does not make sense to go ahead and to
-        // try to load the file while another instance has not yet finished the copy action.
-        // If the app start fails then the user should try to start the app later again.
-        // Unfortunately, we cannot implement delayed retries ourselves because process.dlopen
-        // is a synchronous function, promises are not supported.
-        fs.copyFileSync(curSource, curTarget);
-      }
-    }
-  }
-}
-
-function createDirRecursively(dir) {
-  if (!fs.existsSync(dir)) {
-    createDirRecursively(path.join(dir, '..'));
-    fs.mkdirSync(dir);
-  }
 }
 
 /*
@@ -531,40 +441,29 @@ function payloadCopyManySync(source, target, targetStart, sourceStart) {
   }
 }
 
-const GZIP = 1;
-const BROTLI = 2;
+// Resolve decompressors once at module load: DOCOMPRESS is a compile-time
+// constant baked in by the packer, so the pick never varies across calls —
+// and if the runtime is missing a Zstd API the binary should fail at startup
+// rather than on the first snapshot read.
+const decompressAsync = REQUIRE_SHARED.pickDecompressorAsync(DOCOMPRESS);
+const decompressSync = REQUIRE_SHARED.pickDecompressorSync(DOCOMPRESS);
+
 function payloadFile(pointer, cb) {
   const target = Buffer.alloc(pointer[1]);
   payloadCopyMany(pointer, target, 0, 0, (error) => {
     if (error) return cb(error);
-    if (DOCOMPRESS === GZIP) {
-      gunzip(target, (error2, target2) => {
-        if (error2) return cb(error2);
-        cb(null, target2);
-      });
-    } else if (DOCOMPRESS === BROTLI) {
-      brotliDecompress(target, (error2, target2) => {
-        if (error2) return cb(error2);
-        cb(null, target2);
-      });
-    } else {
-      return cb(null, target);
-    }
+    if (!decompressAsync) return cb(null, target);
+    decompressAsync(target, (error2, target2) => {
+      if (error2) return cb(error2);
+      cb(null, target2);
+    });
   });
 }
 
 function payloadFileSync(pointer) {
   const target = Buffer.alloc(pointer[1]);
   payloadCopyManySync(pointer, target, 0, 0);
-  if (DOCOMPRESS === GZIP) {
-    const target1 = gunzipSync(target);
-    return target1;
-  }
-  if (DOCOMPRESS === BROTLI) {
-    const target1 = brotliDecompressSync(target);
-    return target1;
-  }
-  return target;
+  return decompressSync ? decompressSync(target) : target;
 }
 
 // /////////////////////////////////////////////////////////////////
@@ -572,24 +471,9 @@ function payloadFileSync(pointer) {
 // /////////////////////////////////////////////////////////////////
 
 (() => {
-  process.pkg = {};
+  REQUIRE_SHARED.setupProcessPkg(ENTRYPOINT, DEFAULT_ENTRYPOINT);
   process.versions.pkg = '%VERSION%';
   process.pkg.mount = createMountpoint;
-  process.pkg.entrypoint = ENTRYPOINT;
-  process.pkg.defaultEntrypoint = DEFAULT_ENTRYPOINT;
-})();
-
-// /////////////////////////////////////////////////////////////////
-// PATH.RESOLVE REPLACEMENT ////////////////////////////////////////
-// /////////////////////////////////////////////////////////////////
-
-(() => {
-  process.pkg.path = {};
-  process.pkg.path.resolve = function resolve() {
-    const args = cloneArgs(arguments);
-    args.unshift(path.dirname(ENTRYPOINT));
-    return path.resolve.apply(path, args);
-  };
 })();
 
 // /////////////////////////////////////////////////////////////////
@@ -1054,19 +938,15 @@ function payloadFileSync(pointer) {
     if (entityBlob) {
       return cb2(null, Buffer.from('source-code-not-available'));
     }
-    // why return empty buffer?
-    // otherwise this error will arise:
-    // Error: UNEXPECTED-20
-    //     at readFileFromSnapshot (e:0)
-    //     at Object.fs.readFileSync (e:0)
-    //     at Object.Module._extensions..js (module.js:421:20)
-    //     at Module.load (module.js:357:32)
-    //     at Function.Module._load (module.js:314:12)
-    //     at Function.Module.runMain (e:0)
-    //     at startup (node.js:140:18)
-    //     at node.js:1001:3
-
-    return cb2(new Error('UNEXPECTED-20'));
+    return cb2(
+      new Error(
+        '[pkg] UNEXPECTED-20: no source or bytecode for ' +
+          path_ +
+          '. This usually means V8 bytecode generation failed during ' +
+          'packaging (e.g. cross-compilation without QEMU). Rebuild with ' +
+          '--fallback-to-source, --no-bytecode, or --sea to fix this.',
+      ),
+    );
   }
 
   fs.readFileSync = function readFileSync(path_, options_) {
@@ -1722,12 +1602,16 @@ function payloadFileSync(pointer) {
     fs.promises.stat = util.promisify(fs.stat);
     fs.promises.lstat = util.promisify(fs.lstat);
 
-    /*
     fs.promises.read = util.promisify(fs.read);
     fs.promises.realpath = util.promisify(fs.realpath);
     fs.promises.fstat = util.promisify(fs.fstat);
+    fs.promises.statfs = util.promisify(fs.statfs);
     fs.promises.access = util.promisify(fs.access);
-  */
+
+    // TODO: all promises methods that try to edit files in snapshot should throw
+    // TODO implement missing methods
+    // fs.promises.readlink ?
+    // fs.promises.opendir ?
   }
 
   // ///////////////////////////////////////////////////////////////
@@ -1879,7 +1763,7 @@ function payloadFileSync(pointer) {
     im = require('internal/module');
     makeRequireFunction = im.makeRequireFunction;
   } else {
-    if (NODE_VERSION_MAJOR <= 18) {
+    if (NODE_VERSION_MAJOR < 18) {
       im = require('internal/modules/cjs/helpers');
     } else {
       im = require('internal/modules/helpers');
@@ -1922,7 +1806,18 @@ function payloadFileSync(pointer) {
 
       const script = new Script(code, options);
       const wrapper = script.runInThisContext(options);
-      if (!wrapper) process.exit(4); // for example VERSION_MISMATCH
+      if (!wrapper) {
+        // V8 rejected the cached bytecode (typically because it was
+        // produced by a different V8 build — e.g. cross-platform
+        // bytecode fabrication). Previously pkg exited silently with
+        // code 4; surface a real error so the user knows what to do.
+        throw new Error(
+          `[pkg] V8 rejected the bytecode cache for ${filename_}. ` +
+            `This usually means the binary was built with mismatched ` +
+            `host/target V8 (cross-platform bytecode). Rebuild pkg with ` +
+            `--public-packages "*" --public or --sea to avoid bytecode.`,
+        );
+      }
       const dirname = path.dirname(filename_);
       const rqfn = makeRequireFunction(this);
       const args = [this.exports, rqfn, this, filename_, dirname];
@@ -1987,133 +1882,8 @@ function payloadFileSync(pointer) {
 // /////////////////////////////////////////////////////////////////
 // PATCH CHILD_PROCESS /////////////////////////////////////////////
 // /////////////////////////////////////////////////////////////////
-(() => {
-  const ancestor = {
-    spawn: childProcess.spawn,
-    spawnSync: childProcess.spawnSync,
-    execFile: childProcess.execFile,
-    execFileSync: childProcess.execFileSync,
-    exec: childProcess.exec,
-    execSync: childProcess.execSync,
-  };
 
-  function setOptsEnv(args) {
-    let pos = args.length - 1;
-    if (typeof args[pos] === 'function') pos -= 1;
-    if (typeof args[pos] !== 'object' || Array.isArray(args[pos])) {
-      pos += 1;
-      args.splice(pos, 0, {});
-    }
-    const opts = args[pos];
-    if (!opts.env) opts.env = _extend({}, process.env);
-    if (opts.env.PKG_EXECPATH === 'PKG_INVOKE_NODEJS') return;
-    opts.env.PKG_EXECPATH = EXECPATH;
-  }
-
-  function startsWith2(args, index, name, impostor) {
-    const qsName = `"${name} `;
-    if (args[index].slice(0, qsName.length) === qsName) {
-      args[index] = `"${impostor} ${args[index].slice(qsName.length)}`;
-      return true;
-    }
-    const sName = `${name} `;
-    if (args[index].slice(0, sName.length) === sName) {
-      args[index] = `${impostor} ${args[index].slice(sName.length)}`;
-      return true;
-    }
-    if (args[index] === name) {
-      args[index] = impostor;
-      return true;
-    }
-    return false;
-  }
-
-  function startsWith(args, index, name) {
-    const qName = `"${name}"`;
-    const qEXECPATH = `"${EXECPATH}"`;
-    const jsName = JSON.stringify(name);
-    const jsEXECPATH = JSON.stringify(EXECPATH);
-    return (
-      startsWith2(args, index, name, EXECPATH) ||
-      startsWith2(args, index, qName, qEXECPATH) ||
-      startsWith2(args, index, jsName, jsEXECPATH)
-    );
-  }
-
-  function modifyLong(args, index) {
-    if (!args[index]) return;
-    return (
-      startsWith(args, index, 'node') ||
-      startsWith(args, index, ARGV0) ||
-      startsWith(args, index, ENTRYPOINT) ||
-      startsWith(args, index, EXECPATH)
-    );
-  }
-
-  function modifyShort(args) {
-    if (!args[0]) return;
-    if (!Array.isArray(args[1])) {
-      args.splice(1, 0, []);
-    }
-    if (
-      args[0] === 'node' ||
-      args[0] === ARGV0 ||
-      args[0] === ENTRYPOINT ||
-      args[0] === EXECPATH
-    ) {
-      args[0] = EXECPATH;
-    } else {
-      for (let i = 1; i < args[1].length; i += 1) {
-        const mbc = args[1][i - 1];
-        if (mbc === '-c' || mbc === '/c') {
-          modifyLong(args[1], i);
-        }
-      }
-    }
-  }
-
-  childProcess.spawn = function spawn() {
-    const args = cloneArgs(arguments);
-    setOptsEnv(args);
-    modifyShort(args);
-    return ancestor.spawn.apply(childProcess, args);
-  };
-
-  childProcess.spawnSync = function spawnSync() {
-    const args = cloneArgs(arguments);
-    setOptsEnv(args);
-    modifyShort(args);
-    return ancestor.spawnSync.apply(childProcess, args);
-  };
-
-  childProcess.execFile = function execFile() {
-    const args = cloneArgs(arguments);
-    setOptsEnv(args);
-    modifyShort(args);
-    return ancestor.execFile.apply(childProcess, args);
-  };
-
-  childProcess.execFileSync = function execFileSync() {
-    const args = cloneArgs(arguments);
-    setOptsEnv(args);
-    modifyShort(args);
-    return ancestor.execFileSync.apply(childProcess, args);
-  };
-
-  childProcess.exec = function exec() {
-    const args = cloneArgs(arguments);
-    setOptsEnv(args);
-    modifyLong(args, 0);
-    return ancestor.exec.apply(childProcess, args);
-  };
-
-  childProcess.execSync = function execSync() {
-    const args = cloneArgs(arguments);
-    setOptsEnv(args);
-    modifyLong(args, 0);
-    return ancestor.execSync.apply(childProcess, args);
-  };
-})();
+REQUIRE_SHARED.patchChildProcess(ENTRYPOINT);
 
 // /////////////////////////////////////////////////////////////////
 // PROMISIFY ///////////////////////////////////////////////////////
@@ -2186,71 +1956,5 @@ function payloadFileSync(pointer) {
 // /////////////////////////////////////////////////////////////////
 // PATCH PROCESS ///////////////////////////////////////////////////
 // /////////////////////////////////////////////////////////////////
-(() => {
-  const ancestor = {
-    dlopen: process.dlopen,
-  };
 
-  function revertMakingLong(f) {
-    if (/^\\\\\?\\/.test(f)) return f.slice(4);
-    return f;
-  }
-
-  process.dlopen = function dlopen() {
-    const args = cloneArgs(arguments);
-    const modulePath = revertMakingLong(args[1]);
-    const moduleBaseName = path.basename(modulePath);
-    const moduleFolder = path.dirname(modulePath);
-
-    if (insideSnapshot(modulePath)) {
-      const moduleContent = fs.readFileSync(modulePath);
-
-      // Node addon files and .so cannot be read with fs directly, they are loaded with process.dlopen which needs a filesystem path
-      // we need to write the file somewhere on disk first and then load it
-      // the hash is needed to be sure we reload the module in case it changes
-      const hash = createHash('sha256').update(moduleContent).digest('hex');
-
-      // Example: /tmp/pkg/<hash>
-      const tmpFolder = path.join(tmpdir(), 'pkg', hash);
-
-      createDirRecursively(tmpFolder);
-
-      // Example: moduleFolder = /snapshot/appname/node_modules/sharp/build/Release
-      const parts = moduleFolder.split(path.sep);
-      const mIndex = parts.lastIndexOf('node_modules') + 1;
-
-      let newPath;
-
-      // it's a node addon file contained in node_modules folder
-      // we copy the entire module folder in tmp folder
-      if (mIndex > 0) {
-        // Example: modulePackagePath = sharp/build/Release
-        const modulePackagePath = parts.slice(mIndex).join(path.sep);
-        // Example: modulePkgFolder = /snapshot/appname/node_modules/sharp
-        const modulePkgFolder = parts.slice(0, mIndex + 1).join(path.sep);
-
-        // here we copy all files from the snapshot module folder to temporary folder
-        // we keep the module folder structure to prevent issues with modules that are statically
-        // linked using relative paths (Fix #1075)
-        copyFolderRecursiveSync(modulePkgFolder, tmpFolder);
-
-        // Example: /tmp/pkg/<hash>/sharp/build/Release/sharp.node
-        newPath = path.join(tmpFolder, modulePackagePath, moduleBaseName);
-      } else {
-        const tmpModulePath = path.join(tmpFolder, moduleBaseName);
-
-        if (!fs.existsSync(tmpModulePath)) {
-          fs.copyFileSync(modulePath, tmpModulePath);
-        }
-
-        // load the copied file in the temporary folder
-        newPath = tmpModulePath;
-      }
-
-      // replace the path with the new module path
-      args[1] = newPath;
-    }
-
-    return ancestor.dlopen.apply(process, args);
-  };
-})();
+REQUIRE_SHARED.patchDlopen(insideSnapshot);
